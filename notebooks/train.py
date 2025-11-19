@@ -208,6 +208,12 @@ def masked_mae_loss(y_true, y_pred):
 class TransformerBlock(layers.Layer):
     def __init__(self, embed_dim, num_heads, ff_dim, rate=0.1, **kwargs):
         super().__init__(**kwargs)
+        # 保存用に引数を保持しておく
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.ffn_dim = ff_dim
+        self.rate = rate
+        
         self.att = layers.MultiHeadAttention(num_heads=num_heads, key_dim=embed_dim)
         self.ffn = models.Sequential(
             [layers.Dense(ff_dim, activation="gelu"), layers.Dense(embed_dim),]
@@ -228,33 +234,56 @@ class TransformerBlock(layers.Layer):
     def get_config(self):
         config = super().get_config()
         config.update({
-            "embed_dim": self.att.key_dim,
-            "num_heads": self.att.num_heads,
-            "ff_dim": self.ffn.layers[0].units,
-            "rate": self.dropout1.rate
+            "embed_dim": self.embed_dim,
+            "num_heads": self.num_heads,
+            "ff_dim": self.ffn_dim,
+            "rate": self.rate
         })
         return config
 
+# --- Transformerモデル定義 (TimeDistributed使用による修正版) ---
+
+# (masked_mae_loss と TransformerBlock クラス定義はそのまま変更なしでOKです)
+# build_transformer_model 関数のみ、以下のように完全に書き換えてください
+
 def build_transformer_model(num_features):
+    # 入力: (Batch, Frames, Nodes, Features) -> (B, 100, 23, 13)
     inputs = layers.Input(shape=(MAX_FRAMES, MAX_NODES, num_features))
     
-    x = layers.TimeDistributed(layers.TimeDistributed(layers.Dense(64, activation='gelu')))(inputs)
+    # Embedding: (B, T, N, F) -> (B, T, N, 64)
+    # Denseは末尾の次元に適用されるため、そのまま適用可能
+    x = layers.Dense(64, activation='gelu')(inputs)
     
-    # Spatial Attention
-    x_spatial = layers.Reshape((-1, MAX_NODES, 64))(x)
-    x_spatial = TransformerBlock(embed_dim=64, num_heads=4, ff_dim=128)(x_spatial)
+    # --- 1. Spatial Attention (空間: ノード間の関係) ---
+    # 入力: (B, T, N, 64)
+    # TimeDistributedで「時間(T)」次元をラップすることで、
+    # 内部のTransformerBlockは「各時刻ごとの (B, N, 64)」を処理します。
+    # つまり、時刻ごとに全プレイヤー(N)の関係性を計算します。
+    x_spatial = layers.TimeDistributed(
+        TransformerBlock(embed_dim=64, num_heads=4, ff_dim=128)
+    )(x)
     
-    # Temporal Attention
-    x = layers.Reshape((MAX_FRAMES, MAX_NODES, 64))(x_spatial)
+    # --- 2. Temporal Attention (時間: フレーム間の関係) ---
+    # 入力: (B, T, N, 64)
+    # まず「プレイヤー(N)」と「時間(T)」を入れ替えます -> (B, N, T, 64)
     x_temporal = layers.Permute((2, 1, 3))(x)
-    x_temporal = layers.Reshape((-1, MAX_FRAMES, 64))(x_temporal)
     
-    x_temporal = TransformerBlock(embed_dim=64, num_heads=4, ff_dim=128)(x_temporal)
+    # TimeDistributedで「プレイヤー(N)」次元をラップします。
+    # 内部のTransformerBlockは「各プレイヤーごとの (B, T, 64)」を処理します。
+    # つまり、プレイヤーごとに時間の流れ(T)を学習します。
+    x_temporal = layers.TimeDistributed(
+        TransformerBlock(embed_dim=64, num_heads=4, ff_dim=128)
+    )(x_temporal)
     
-    x_temporal = layers.Reshape((-1, MAX_NODES, MAX_FRAMES, 64))(x_temporal)
-    x = layers.Permute((2, 1, 3))(x_temporal)
+    # 元の順序に戻します: (B, N, T, 64) -> (B, T, N, 64)
+    x_temporal = layers.Permute((2, 1, 3))(x_temporal)
     
-    output = layers.TimeDistributed(layers.TimeDistributed(layers.Dense(2)))(x)
+    # --- Output Head ---
+    # 空間的特徴と時間的特徴を足し合わせる (Residual Connectionのような効果)
+    x = layers.Add()([x_spatial, x_temporal])
+    
+    # 座標予測 (x, y)
+    output = layers.Dense(2)(x)
     
     model = models.Model(inputs=inputs, outputs=output)
     
